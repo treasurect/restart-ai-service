@@ -1,55 +1,34 @@
 package com.treasure.restart.ai.service;
 
 import com.treasure.common.helper.LogHelper;
+import com.treasure.restart.ai.model.ChatModel;
+import com.treasure.restart.ai.service.llm.AiChatOptions;
+import com.treasure.restart.ai.service.llm.AiModelClient;
 import com.treasure.restart.ai.context.AiTokenCounter;
 import com.treasure.restart.ai.entity.AiConversation;
 import com.treasure.restart.ai.entity.AiMessage;
 import com.treasure.restart.ai.mapper.AiConversationMapper;
 import com.treasure.restart.ai.mapper.AiMessageMapper;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.MediaType;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestClient;
-import tools.jackson.databind.JsonNode;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 @Service
+@RequiredArgsConstructor
 public class AiSummaryService {
-
-    private static final int KEEP_RECENT_TURNS = 2;
-    private static final int SUMMARY_MAX_TOKENS = 1500;
 
     private final AiConversationMapper conversationMapper;
     private final AiMessageMapper messageMapper;
     private final AiTokenCounter tokenCounter;
-    private final RestClient restClient;
-    private final String apiKey;
-    private final String model;
+    private final AiModelClient aiModelClient;
 
-    public AiSummaryService(
-            AiConversationMapper conversationMapper,
-            AiMessageMapper messageMapper,
-            AiTokenCounter tokenCounter,
-            RestClient.Builder restClientBuilder,
-            @Value("${deepseek.api-key}") String apiKey,
-            @Value("${deepseek.base-url:https://api.deepseek.com}") String baseUrl,
-            @Value("${deepseek.model:deepseek-flash}") String model
-    ) {
-        this.conversationMapper = conversationMapper;
-        this.messageMapper = messageMapper;
-        this.tokenCounter = tokenCounter;
-        this.apiKey = apiKey;
-        this.model = model;
-        this.restClient = restClientBuilder
-                .baseUrl(baseUrl)
-                .build();
-    }
-
-    public boolean toCheckOrUpdateSummary(Long cid, Long userId) {
+    /**
+     * 1.现将用户+助手 计算N轮对话，预留最近2轮消息 再往前 >= 2轮 就形成摘要
+     */
+    public void toCheckOrUpdateSummary(Long cid, Long userId) {
         AiConversation conversation = conversationMapper.getCurrentConversation(cid, userId);
         if (conversation == null) throw new IllegalArgumentException("会话不存在或无权访问");
         Long oldUptoMsgId = conversation.getSummaryUptoMessageId();
@@ -58,24 +37,23 @@ public class AiSummaryService {
         List<List<AiMessage>> completeTurns = buildCompleteTurns(messageMapper.loadCompletedMessagesAfterId(cid, oldUptoMsgId));
         //预留最近消息2条 阈值2个
         int needSaveCount = completeTurns.size() - 2;
-        if (needSaveCount < KEEP_RECENT_TURNS) return false;
+        if (needSaveCount < 2) return;
         ArrayList<List<AiMessage>> needSaveTurns = new ArrayList<>(completeTurns.subList(0, needSaveCount));
 
         ArrayList<AiMessage> needSaveMessages = new ArrayList<>();
         for (List<AiMessage> needSaveTurn : needSaveTurns) {
             needSaveMessages.addAll(needSaveTurn);
         }
-        if (needSaveMessages.isEmpty()) return false;
+        if (needSaveMessages.isEmpty()) return;
         Long newUptoMsgId = needSaveMessages.get(needSaveMessages.size() - 1).getId();
-        if (newUptoMsgId == null || newUptoMsgId < oldUptoMsgId) return false;
+        if (newUptoMsgId == null || newUptoMsgId < oldUptoMsgId) return;
 
         String oldSummary = conversation.getSummary();
         String newSummary = generateSummary(oldSummary, needSaveMessages);
-        if (newSummary == null || newSummary.isBlank()) return false;
+        if (newSummary == null || newSummary.isBlank()) return;
         int summaryTokens = tokenCounter.count(newSummary);
         int i = conversationMapper.updateSummary(cid, userId, newSummary, newUptoMsgId, summaryTokens, oldUptoMsgId);
         LogHelper.info("AiSummaryService -> 摘要更新" + (i == 1 ? "成功" : "失败") + "，conversationId={" + cid + "}, uptoMessageId={" + newUptoMsgId + "}, summaryTokens={" + summaryTokens + "}");
-        return i == 1;
     }
 
     /**
@@ -145,27 +123,10 @@ public class AiSummaryService {
                 [新增的完整对话轮次]:%s。
                 请将这两部分合并为一份最新摘要
                 """.formatted(oldSummary == null || oldSummary.isBlank() ? "无内容" : oldSummary, builder);
-        HashMap<String, Object> map = new HashMap<>();
-        map.put("model", model);
-        map.put("stream", false);
-        map.put("temperature", 0.1);
-        map.put("max_tokens", SUMMARY_MAX_TOKENS);
-        map.put("messages", List.of(
-                Map.of("role", "system", "content", systemPrompt),
-                Map.of("role", "user", "content", userPrompt)
-        ));
-        JsonNode response = restClient.post()
-                .uri("/chat/completions")
-                .contentType(MediaType.APPLICATION_JSON)
-                .accept(MediaType.APPLICATION_JSON)
-                .header("Authorization", "Bearer " + apiKey)
-                .body(map)
-                .retrieve()
-                .body(JsonNode.class);
-        if (response == null) throw new IllegalStateException("DeepSeek 摘要接口返回为空");
-        JsonNode content = response.path("choices").path(0).path("message").path("content");
-        if (!content.isString()) throw new IllegalStateException("DeepSeek 摘要响应缺少 message.content");
-        String summary = content.asString().trim();
+        ArrayList<ChatModel> messages = new ArrayList<>();
+        messages.add(ChatModel.system(systemPrompt));
+        messages.add(ChatModel.user(userPrompt));
+        String summary = aiModelClient.chat(messages, new AiChatOptions(0.1, 1500, false, null)).trim();
         if (summary.isBlank()) throw new IllegalStateException("DeepSeek 返回空摘要");
         return summary;
     }

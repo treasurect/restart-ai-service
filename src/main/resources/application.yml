@@ -17,14 +17,17 @@ mybatis:
   configuration:
     map-underscore-to-camel-case: true
 
-deepseek:
-  api-key: ${DEEPSEEK_API_KEY}
-  base-url: https://api.deepseek.com
-  model: deepseek-flash
-  connect-timeout: 10s
-  response-timeout: 180s
-  tokenizer:
-    path: ${DEEPSEEK_TOKENIZER_PATH:./tokenizers/v41/tokenizer.json}
+ai:
+  provider: deepseek
+  providers:
+    deepseek:
+      api-key: ${DEEPSEEK_API_KEY}
+      base-url: https://api.deepseek.com
+      model: deepseek-flash
+      connect-timeout: 10s
+      response-timeout: 180s
+      tokenizer:
+        path: ${DEEPSEEK_TOKENIZER_PATH:./tokenizers/v41/tokenizer.json}
 
 jwt:
   public-key-path: ${JWT_PUBLIC_KEY_PATH}

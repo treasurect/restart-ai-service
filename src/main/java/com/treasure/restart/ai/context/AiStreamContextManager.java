@@ -1,7 +1,7 @@
 package com.treasure.restart.ai.context;
 
 import com.treasure.common.helper.LogHelper;
-import com.treasure.restart.ai.AiMessageStatus;
+import com.treasure.restart.ai.config.AiMessageStatus;
 import reactor.core.Disposable;
 
 import java.util.concurrent.atomic.AtomicReference;

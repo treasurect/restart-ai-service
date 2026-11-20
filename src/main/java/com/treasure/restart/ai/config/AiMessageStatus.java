@@ -1,4 +1,4 @@
-package com.treasure.restart.ai;
+package com.treasure.restart.ai.config;
 
 public enum AiMessageStatus {
 

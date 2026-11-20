@@ -3,7 +3,8 @@ package com.treasure.restart.ai.service;
 import com.treasure.common.UserContext;
 import com.treasure.common.exception.BusinessException;
 import com.treasure.common.helper.LogHelper;
-import com.treasure.restart.ai.DeepSeekClient;
+import com.treasure.restart.ai.model.ChatModel;
+import com.treasure.restart.ai.service.llm.AiModelClient;
 import com.treasure.restart.ai.context.AiContextBuilder;
 import com.treasure.restart.ai.context.AiStreamContextManager;
 import com.treasure.restart.ai.dto.AiChatRequest;
@@ -11,7 +12,7 @@ import com.treasure.restart.ai.dto.AiChatResponse;
 import com.treasure.restart.ai.dto.AiStreamEvent;
 import com.treasure.restart.ai.entity.AiConversation;
 import com.treasure.restart.ai.entity.AiMessage;
-import com.treasure.restart.ai.AiMessageStatus;
+import com.treasure.restart.ai.config.AiMessageStatus;
 import com.treasure.restart.ai.mapper.AiConversationMapper;
 import com.treasure.restart.ai.mapper.AiMessageMapper;
 import jakarta.annotation.Resource;
@@ -28,7 +29,7 @@ import java.util.concurrent.ExecutorService;
 @Service
 public class AiChatServiceImpl implements AiChatService {
     @Resource
-    private DeepSeekClient deepSeekClient;
+    private AiModelClient aiModelClient;
     @Resource
     private AiConversationMapper aiConversationMapper;
     @Resource
@@ -41,7 +42,7 @@ public class AiChatServiceImpl implements AiChatService {
     private ExecutorService executor;
     @Resource
     private AiMessageService aiMessageService;
-
+    private static final String SYSTEM_PROMPT = "你是一个友好、准确的 AI 助手，请使用清晰、实用的中文回答。";
     @Transactional
     public AiChatResponse chat(AiChatRequest request) {
         Long userId = UserContext.getUserId();
@@ -56,8 +57,8 @@ public class AiChatServiceImpl implements AiChatService {
     @Override
     @Transactional
     public AiChatResponse chatAsGuest(AiChatRequest request) {
-        ArrayList<Map<String, Object>> maps = new ArrayList<>();
-        maps.add(systemMessage());
+        ArrayList<ChatModel> maps = new ArrayList<>();
+        maps.add(ChatModel.system(SYSTEM_PROMPT));
         List<AiChatRequest.HistoryMsgItem> history = request.history();
         if (history != null && !history.isEmpty()) {
             if (history.size() >= 20) throw new BusinessException("游客历史消息不能超过20条");
@@ -65,15 +66,15 @@ public class AiChatServiceImpl implements AiChatService {
                 if (item == null || item.role() == null || item.content() == null || item.content().isBlank()) {
                     throw new BusinessException("历史消息格式不正确");
                 }
-
-                if (!"user".equals(item.role()) && !"assistant".equals(item.role())) {
-                    throw new BusinessException("历史消息角色不合法");
-                }
-                maps.add(Map.of("role", item.role(), "content", item.content()));
+                if ("user".equals(item.role())){
+                    maps.add(ChatModel.user(item.content()));
+                } else if ("assistant".equals(item.role())){
+                    maps.add(ChatModel.assistant(item.content()));
+                } else throw new BusinessException("历史消息角色不合法");
             }
         }
-        maps.add(Map.of("role", "user", "content", request.message()));
-        String reply = deepSeekClient.chat(maps);
+        maps.add(ChatModel.user(request.message()));
+        String reply = aiModelClient.chat(maps);
         return new AiChatResponse(null, reply);
     }
 
@@ -81,32 +82,21 @@ public class AiChatServiceImpl implements AiChatService {
     @Transactional
     public AiChatResponse chatAsUser(AiChatRequest request) {
         Long userId = UserContext.getUserId();
-//        ArrayList<Map<String, String>> maps = new ArrayList<>();
-//        maps.add(systemMessage());
         AiConversation conversation;
+        List<AiMessage> historyMessages = List.of();
         if (request.conversationId() == null) {
             conversation = new AiConversation();
             conversation.setUserId(userId);
             conversation.setTitle(request.message());
             aiConversationMapper.insertConversation(conversation);
-//            maps.add(Map.of("role", "user", "content", request.message()));
         } else {
             conversation = aiConversationMapper.getCurrentConversation(request.conversationId(), userId);
             if (conversation == null) throw new BusinessException("会话不存在或无权访问");
-//            List<AiMessage> history = aiMessageMapper.loadLatestCompletedMessages(conversation.getId(), 20);
-//            Collections.reverse(history);
-//            for (AiMessage message : history) {
-//
-//                maps.add(Map.of("role", message.getRole(), "content", message.getContent()));
-//            }
-//            maps.add(Map.of("role", "user", "content", request.message()));
+            historyMessages = aiMessageMapper.loadLatestCompletedMessages(conversation.getId(), 20);
         }
-        List<AiMessage> historyMessages = aiMessageMapper.loadLatestCompletedMessages(conversation.getId(), 20);
-
-
-        String content = systemMessage().get("content") instanceof  String ? (String) systemMessage().get("content") : null;
-        List<Map<String, Object>> messages = aiContextBuilder.build(content, historyMessages, request.message(), 6000);
-        String reply = deepSeekClient.chat(messages);
+        
+        List<ChatModel> messages = aiContextBuilder.build(SYSTEM_PROMPT, historyMessages, request.message(), 6000);
+        String reply = aiModelClient.chat(messages);
 
         aiMessageService.saveMessage(UserContext.getUserId(), "user", conversation.getId(), request.message(), AiMessageStatus.COMPLETED);
         aiMessageService.saveMessage(UserContext.getUserId(), "assistant", conversation.getId(), reply, AiMessageStatus.COMPLETED);
@@ -181,22 +171,30 @@ public class AiChatServiceImpl implements AiChatService {
             boolean assistantSaved = false;
             try {
                 AiConversation conversation;
+                List<AiMessage> historyMessages = null;
                 if (conversationId == null) {
                     conversation = new AiConversation();
                     conversation.setUserId(userId);
                     conversation.setTitle(request.message() == null || request.message().isBlank() ? "图片消息" : request.message());
                     aiConversationMapper.insertConversation(conversation);
+                    conversationId = conversation.getId();
                 } else {
                     conversation = aiConversationMapper.getCurrentConversation(conversationId, userId);
                     if (conversation == null) throw new BusinessException("会话不存在");
+                    if (!context.isGenerating()) return;
+                    try {
+                        aiSummaryService.toCheckOrUpdateSummary(conversationId, userId);
+                    } catch (Exception e) {
+                        LogHelper.error("AI 历史摘要生成失败，继续使用现有摘要。conversationId={" + conversationId + "}, error=" + e.getMessage());
+                    }
+                    conversation = aiConversationMapper.getCurrentConversation(conversationId, userId);
+                    long summaryUptoMsgId = conversation.getSummaryUptoMessageId() == null ? 0 : conversation.getSummaryUptoMessageId();
+                    historyMessages = aiMessageMapper.loadCompletedMessagesAfterId(conversationId, summaryUptoMsgId);
                 }
-                conversationId = conversation.getId();
-
-                Long finalConversationId = conversationId;
 
                 /** ArrayList<Map<String, String>> messages = new ArrayList<>();
                  messages.add(systemMessage());
-                 List<AiMessage> history = aiMessageMapper.loadLatestCompletedMessages(finalConversationId, 20);
+                 List<AiMessage> history = aiMessageMapper.loadLatestCompletedMessages(conversationId, 20);
                  if (history != null) {
                  for (AiMessage message : history) {
                  messages.add(Map.of("role", message.getRole(), "content", message.getContent()));
@@ -204,20 +202,11 @@ public class AiChatServiceImpl implements AiChatService {
                  }
 
                  messages.add(Map.of("role", "user", "content", request.message()));
-                 saveMessage("user", finalConversationId, request.message(), AiMessageStatus.COMPLETED); */
+                 saveMessage("user", conversationId, request.message(), AiMessageStatus.COMPLETED); */
                 //List<AiMessage> historyMessages = aiMessageMapper.loadLatestCompletedMessages(conversationId, 20);
-                if (!context.isGenerating()) return;
-                try {
-                    aiSummaryService.toCheckOrUpdateSummary(finalConversationId, userId);
-                } catch (Exception e) {
-                    LogHelper.error("AI 历史摘要生成失败，继续使用现有摘要。conversationId={" + conversationId + "}, error=" + e.getMessage());
-                }
-                conversation = aiConversationMapper.getCurrentConversation(finalConversationId, userId);
-                long summaryUptoMsgId = conversation.getSummaryUptoMessageId() == null ? 0 : conversation.getSummaryUptoMessageId();
-                List<AiMessage> historyMessages = aiMessageMapper.loadCompletedMessagesAfterId(conversationId, summaryUptoMsgId);
-                String content = systemMessage().get("content") instanceof String ? (String) systemMessage().get("content") : null;
-                List<Map<String, Object>> messages = aiContextBuilder.build(
-                        content,
+
+                List<ChatModel> messages = aiContextBuilder.build(
+                        SYSTEM_PROMPT,
                         conversation.getSummary(),
                         historyMessages,
                         request.message(),
@@ -225,19 +214,20 @@ public class AiChatServiceImpl implements AiChatService {
                         6000
                 );
 
-                aiMessageService.saveMessage(userId, "user", finalConversationId, request.message(), request.imageUrls(), AiMessageStatus.COMPLETED);
+                aiMessageService.saveMessage(userId, "user", conversationId, request.message(), request.imageUrls(), AiMessageStatus.COMPLETED);
 
                 if (!context.isGenerating()) return;
 
-                LogHelper.info("AI SSE 开始生成，conversationId=" + finalConversationId);
-                emitter.send(SseEmitter.event().name("start").data(new AiStreamEvent("start", "", finalConversationId, null)));
-                deepSeekClient.chatStream(messages, token -> {
+                LogHelper.info("AI SSE 开始生成，conversationId=" + conversationId);
+                final Long conversationIdFinal = conversationId;
+                emitter.send(SseEmitter.event().name("start").data(new AiStreamEvent("start", "", conversationId, null)));
+                aiModelClient.chatStream(messages, token -> {
                     if (!context.isGenerating()) return;
                     // 保存已经生成的内容
                     //context.append(token);
 
                     try {
-                        emitter.send(SseEmitter.event().name("token").data(new AiStreamEvent("token", token, finalConversationId, null)));
+                        emitter.send(SseEmitter.event().name("token").data(new AiStreamEvent("token", token, conversationIdFinal, null)));
                     } catch (IOException e) {
                         context.cancel();
                         LogHelper.info("发送 SSE token 失败，客户端可能已断开");
@@ -245,28 +235,28 @@ public class AiChatServiceImpl implements AiChatService {
                 }, context);
 
                 AiMessageStatus finalStatus = context.getStatus();
-                LogHelper.info("AI SSE 生成结束，conversationId=" + finalConversationId + ", status=" + finalStatus + ", length=" + context.getContent().length());
+                LogHelper.info("AI SSE 生成结束，conversationId=" + conversationId + ", status=" + finalStatus + ", length=" + context.getContent().length());
                 switch (finalStatus) {
                     case COMPLETED -> {
-                        AiMessage message = aiMessageService.saveMessage(userId, "assistant", finalConversationId, context.getContent(), AiMessageStatus.COMPLETED);
+                        AiMessage message = aiMessageService.saveMessage(userId, "assistant", conversationId, context.getContent(), AiMessageStatus.COMPLETED);
                         assistantSaved = true;
-                        emitter.send(SseEmitter.event().name("complete").data(new AiStreamEvent("complete", "", finalConversationId, message.getId())));
+                        emitter.send(SseEmitter.event().name("complete").data(new AiStreamEvent("complete", "", conversationId, message.getId())));
                         emitter.complete();
                     }
                     case CANCELLED -> {
                         if (!context.getContent().isBlank()) {
-                            aiMessageService.saveMessage(userId, "assistant", finalConversationId, context.getContent(), finalStatus);
+                            aiMessageService.saveMessage(userId, "assistant", conversationId, context.getContent(), finalStatus);
                             assistantSaved = true;
                         }
                         emitter.complete();
                     }
                     case TIMEOUT -> {
                         if (!context.getContent().isBlank()) {
-                            aiMessageService.saveMessage(userId, "assistant", finalConversationId, context.getContent(), finalStatus);
+                            aiMessageService.saveMessage(userId, "assistant", conversationId, context.getContent(), finalStatus);
                             assistantSaved = true;
                         }
                         try {
-                            emitter.send(SseEmitter.event().name("error").data(new AiStreamEvent("error", "AI 回复生成超时", finalConversationId, null)));
+                            emitter.send(SseEmitter.event().name("error").data(new AiStreamEvent("error", "AI 回复生成超时", conversationId, null)));
                         } catch (Exception ignored) {
                             // 客户端可能已经断开
                         }
@@ -291,9 +281,5 @@ public class AiChatServiceImpl implements AiChatService {
                 }
             }
         });
-    }
-
-    private Map<String, Object> systemMessage() {
-        return Map.of("role", "system", "content", "你是一个友好、准确的 AI 助手，请使用清晰、实用的中文回答。");
     }
 }

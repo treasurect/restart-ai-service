@@ -1,9 +1,9 @@
 
-package com.treasure.restart.ai;
+package com.treasure.restart.ai.service.llm;
 
-import com.treasure.common.helper.LogHelper;
 import com.treasure.common.exception.BusinessException;
 import com.treasure.restart.ai.context.AiStreamContextManager;
+import com.treasure.restart.ai.model.ChatModel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -17,6 +17,8 @@ import reactor.core.Disposable;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -25,7 +27,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 @Component
-public class DeepSeekClient {
+public class DeepSeekClient implements AiModelClient {
 
     private static final Logger log = LoggerFactory.getLogger(DeepSeekClient.class);
 
@@ -34,9 +36,9 @@ public class DeepSeekClient {
     private final ObjectMapper objectMapper;
 
     public DeepSeekClient(
-            @Value("${deepseek.api-key}") String apiKey,
-            @Value("${deepseek.base-url}") String baseUrl,
-            @Value("${deepseek.model}") String model,
+            @Value("${ai.providers.deepseek.api-key}") String apiKey,
+            @Value("${ai.providers.deepseek.base-url}") String baseUrl,
+            @Value("${ai.providers.deepseek.model}") String model,
             ObjectMapper objectMapper
     ) {
         this.model = model;
@@ -52,14 +54,9 @@ public class DeepSeekClient {
     /**
      * 非流式请求
      */
-    public String chat(List<Map<String, Object>> messages) {
-        Map<String, Object> request = Map.of(
-                "model", model,
-                "messages", messages,
-                "thinking", Map.of("type", "enabled"),
-                "reasoning_effort", "high",
-                "stream", false
-        );
+    @Override
+    public String chat(List<ChatModel> messages, AiChatOptions options) {
+        Map<String, Object> request = buildRequest(messages, options, false);
 
         JsonNode response = webClient.post()
                 .uri("/chat/completions")
@@ -86,18 +83,13 @@ public class DeepSeekClient {
      * DeepSeek 流式请求。
      * 返回已生成的完整文本；取消或超时时返回已接收的部分文本。
      */
-    public String chatStream(List<Map<String, Object>> messages, Consumer<String> onToken, AiStreamContextManager context) {
+    @Override
+    public String chatStream(List<ChatModel> messages, Consumer<String> onToken, AiStreamContextManager context) {
         StringBuilder builder = new StringBuilder();
         CountDownLatch latch = new CountDownLatch(1);
         AtomicReference<Throwable> errorRef = new AtomicReference<>();
 
-        Map<String, Object> request = Map.of(
-                "model", model,
-                "messages", messages,
-                "thinking", Map.of("type", "enabled"),
-                "reasoning_effort", "high",
-                "stream", true
-        );
+        Map<String, Object> request = buildRequest(messages, AiChatOptions.chatDefaults(), true);
 
         Disposable disposable = webClient.post()
                 .uri("/chat/completions")
@@ -234,5 +226,52 @@ public class DeepSeekClient {
         synchronized (builder) {
             return builder.toString();
         }
+    }
+
+    private Map<String, Object> buildRequest(List<ChatModel> messages, AiChatOptions options, boolean stream) {
+        Map<String, Object> request = new HashMap<>();
+        request.put("model", model);
+        request.put("messages", toWireMessages(messages));
+
+        if (options.temperature() != null) {
+            request.put("temperature", options.temperature());
+        }
+        if (options.maxTokens() != null) {
+            request.put("max_tokens", options.maxTokens());
+        }
+        if (Boolean.TRUE.equals(options.thinkingEnabled())) {
+            request.put("thinking", Map.of("type", "enabled"));
+            if (options.reasoningEffort() != null) {
+                request.put("reasoning_effort", options.reasoningEffort());
+            }
+        }
+        request.put("stream", stream);
+        return request;
+    }
+
+    private List<Map<String, Object>> toWireMessages(List<ChatModel> messages) {
+        return messages.stream().map(message ->
+                Map.of("role", message.role().toApiRole(),
+                        "content", message.hasImage() ? buildImageContent(message) : message.content())).toList();
+    }
+
+    private List<Map<String, Object>> buildImageContent(ChatModel message) {
+        List<Map<String, Object>> content = new ArrayList<>();
+
+        if (!message.content().isBlank()) {
+            content.add(Map.of("type", "text", "text", message.content()));
+        }
+
+        for (String imageUrl : message.imageUrls()) {
+            content.add(Map.of(
+                    "type", "image_url",
+                    "image_url", Map.of(
+                            "url", imageUrl,
+                            "detail", "auto"
+                    )
+            ));
+        }
+
+        return content;
     }
 }

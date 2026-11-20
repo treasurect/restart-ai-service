@@ -15,7 +15,7 @@ import java.nio.file.Path;
 public class AiTokenCounter {
     private final HuggingFaceTokenizer tokenizer;
 
-    public AiTokenCounter(@Value("${deepseek.tokenizer.path:./tokenizers/v41/tokenizer.json}") String tokenizerPath) {
+    public AiTokenCounter(@Value("${ai.providers.deepseek.tokenizer.path:./tokenizers/v41/tokenizer.json}") String tokenizerPath) {
         Path path = Path.of(tokenizerPath).toAbsolutePath().normalize();
         if (!Files.isRegularFile(path)) throw new BusinessException("DeepSeek Tokenizer 文件不存在：" + path);
         try {

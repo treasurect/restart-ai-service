@@ -4,6 +4,7 @@ package com.treasure.restart.ai.context;
 import com.treasure.common.helper.LogHelper;
 import com.treasure.common.exception.BusinessException;
 import com.treasure.restart.ai.entity.AiMessage;
+import com.treasure.restart.ai.model.ChatModel;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
@@ -24,7 +25,7 @@ public class AiContextBuilder {
         this.objectMapper = objectMapper;
     }
 
-    public List<Map<String, Object>> build(
+    public List<ChatModel> build(
             String systemPrompt,
             List<AiMessage> history,
             String currentMessage,
@@ -33,7 +34,7 @@ public class AiContextBuilder {
         return build(systemPrompt, null, history, currentMessage, null, maxInputTokens);
     }
 
-    public List<Map<String, Object>> build(
+    public List<ChatModel> build(
             String systemPrompt,
             String summary,
             List<AiMessage> history,
@@ -49,7 +50,7 @@ public class AiContextBuilder {
      * maxInputTokens 包含 system、摘要、历史消息、
      * 当前用户消息的文本 Token。
      */
-    public List<Map<String, Object>> build(
+    public List<ChatModel> build(
             String systemPrompt,
             String summary,
             List<AiMessage> history,
@@ -107,34 +108,30 @@ public class AiContextBuilder {
         Collections.reverse(selectedTurns);
         //===================================================================================
         //组合deepseek 的消息 前序+概要+历史+当前
-        List<Map<String, Object>> messages = new ArrayList<>();
-        messages.add(Map.of("role", "system", "content", safeSystemPrompt));
-        if (safeSummary != null) messages.add(Map.of(
-                "role", "system",
-                "content", """
+        List<ChatModel> messages = new ArrayList<>();
+        messages.add(ChatModel.system(safeSystemPrompt));
+        if (safeSummary != null) messages.add(ChatModel.system("""
                         以下是此前对话的历史摘要，仅用于理解背景。
                         如果摘要与当前用户明确提供的新信息冲突，
                         应优先采用当前用户提供的信息。
                         
                         历史摘要：
-                        """ + safeSummary
-        ));
+                        """ + safeSummary));
         // 历史消息
         for (List<AiMessage> turn : selectedTurns) {
             for (AiMessage message : turn) {
                 String role = message.getRole().toLowerCase();
-                Object content;
                 if ("user".equals(role)) {
                     List<String> imageUrls = getImageUrls(message.getExtra());
-                    content = buildImageContent(message.getContent(), imageUrls);
+                    //content = buildImageContent(message.getContent(), imageUrls);
+                    messages.add(ChatModel.user(message.getContent(), imageUrls));
                 } else {
                     // assistant 消息：始终使用普通文本
-                    content = message.getContent();
+                    messages.add(ChatModel.assistant(message.getContent()));
                 }
-                messages.add(Map.of("role", role, "content", content));
             }
         }
-        messages.add(Map.of("role", "user", "content", buildImageContent(safeCurrentMessage, currentImageUrls)));
+        messages.add(ChatModel.user(safeCurrentMessage, currentImageUrls));
         LogHelper.info(
                 "AiContextBuilder -> systemTokens={" + systemTokens
                         + "}, summaryTokens={" + summaryTokens

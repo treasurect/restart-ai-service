@@ -1,6 +1,6 @@
 package com.treasure.restart.ai.entity;
 
-import com.treasure.restart.ai.AiMessageStatus;
+import com.treasure.restart.ai.config.AiMessageStatus;
 import lombok.Getter;
 import lombok.Setter;
 
