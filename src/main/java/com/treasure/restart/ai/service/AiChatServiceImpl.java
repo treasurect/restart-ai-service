@@ -3,8 +3,7 @@ package com.treasure.restart.ai.service;
 import com.treasure.common.UserContext;
 import com.treasure.common.exception.BusinessException;
 import com.treasure.common.helper.LogHelper;
-import com.treasure.restart.ai.model.ChatModel;
-import com.treasure.restart.ai.service.llm.AiModelClient;
+import com.treasure.restart.ai.config.AiMessageStatus;
 import com.treasure.restart.ai.context.AiContextBuilder;
 import com.treasure.restart.ai.context.AiStreamContextManager;
 import com.treasure.restart.ai.dto.AiChatRequest;
@@ -12,24 +11,27 @@ import com.treasure.restart.ai.dto.AiChatResponse;
 import com.treasure.restart.ai.dto.AiStreamEvent;
 import com.treasure.restart.ai.entity.AiConversation;
 import com.treasure.restart.ai.entity.AiMessage;
-import com.treasure.restart.ai.config.AiMessageStatus;
 import com.treasure.restart.ai.mapper.AiConversationMapper;
 import com.treasure.restart.ai.mapper.AiMessageMapper;
 import jakarta.annotation.Resource;
+import org.springframework.http.HttpHeaders;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import reactor.core.Disposable;
+import tools.jackson.databind.JsonNode;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Service
 public class AiChatServiceImpl implements AiChatService {
-    @Resource
-    private AiModelClient aiModelClient;
     @Resource
     private AiConversationMapper aiConversationMapper;
     @Resource
@@ -42,7 +44,11 @@ public class AiChatServiceImpl implements AiChatService {
     private ExecutorService executor;
     @Resource
     private AiMessageService aiMessageService;
+    @Resource
+    private LlmHttpService llmHttpService;
+
     private static final String SYSTEM_PROMPT = "你是一个友好、准确的 AI 助手，请使用清晰、实用的中文回答。";
+
     @Transactional
     public AiChatResponse chat(AiChatRequest request) {
         Long userId = UserContext.getUserId();
@@ -57,8 +63,8 @@ public class AiChatServiceImpl implements AiChatService {
     @Override
     @Transactional
     public AiChatResponse chatAsGuest(AiChatRequest request) {
-        ArrayList<ChatModel> maps = new ArrayList<>();
-        maps.add(ChatModel.system(SYSTEM_PROMPT));
+        List<Map<String, Object>> maps = new ArrayList<>();
+        maps.add(llmHttpService.textMessage("SYSTEM", SYSTEM_PROMPT));
         List<AiChatRequest.HistoryMsgItem> history = request.history();
         if (history != null && !history.isEmpty()) {
             if (history.size() >= 20) throw new BusinessException("游客历史消息不能超过20条");
@@ -67,14 +73,14 @@ public class AiChatServiceImpl implements AiChatService {
                     throw new BusinessException("历史消息格式不正确");
                 }
                 if ("user".equals(item.role())){
-                    maps.add(ChatModel.user(item.content()));
+                    maps.add(llmHttpService.textMessage("USER", item.content()));
                 } else if ("assistant".equals(item.role())){
-                    maps.add(ChatModel.assistant(item.content()));
+                    maps.add(llmHttpService.textMessage("ASSISTANT", item.content()));
                 } else throw new BusinessException("历史消息角色不合法");
             }
         }
-        maps.add(ChatModel.user(request.message()));
-        String reply = aiModelClient.chat(maps);
+        maps.add(llmHttpService.textMessage("USER", request.message()));
+        String reply = llmHttpService.chat(maps, null, request.modelId(), currentAuthorization());
         return new AiChatResponse(null, reply);
     }
 
@@ -95,8 +101,8 @@ public class AiChatServiceImpl implements AiChatService {
             historyMessages = aiMessageMapper.loadLatestCompletedMessages(conversation.getId(), 20);
         }
         
-        List<ChatModel> messages = aiContextBuilder.build(SYSTEM_PROMPT, historyMessages, request.message(), 6000);
-        String reply = aiModelClient.chat(messages);
+        List<Map<String, Object>> messages = aiContextBuilder.build(SYSTEM_PROMPT, historyMessages, request.message(), 6000);
+        String reply = llmHttpService.chat(messages, null, request.modelId(), currentAuthorization());
 
         aiMessageService.saveMessage(UserContext.getUserId(), "user", conversation.getId(), request.message(), AiMessageStatus.COMPLETED);
         aiMessageService.saveMessage(UserContext.getUserId(), "assistant", conversation.getId(), reply, AiMessageStatus.COMPLETED);
@@ -140,8 +146,14 @@ public class AiChatServiceImpl implements AiChatService {
     public void chatStream(AiChatRequest request, SseEmitter emitter) {
         // 必须在当前请求线程获取
         Long userId = UserContext.getUserId();
+        String authorization = currentAuthorization();
+        final String modelId = request.modelId();
         if (userId == null) {
             emitter.completeWithError(new BusinessException("流式聊天需要登录用户"));
+            return;
+        }
+        if (authorization == null || authorization.isBlank()) {
+            emitter.completeWithError(new BusinessException("缺少 LLM 鉴权信息"));
             return;
         }
 
@@ -168,7 +180,7 @@ public class AiChatServiceImpl implements AiChatService {
 
         executor.execute(() -> {
             Long conversationId = request.conversationId();
-            boolean assistantSaved = false;
+            AtomicBoolean assistantSaved = new AtomicBoolean(false);
             try {
                 AiConversation conversation;
                 List<AiMessage> historyMessages = null;
@@ -183,7 +195,7 @@ public class AiChatServiceImpl implements AiChatService {
                     if (conversation == null) throw new BusinessException("会话不存在");
                     if (!context.isGenerating()) return;
                     try {
-                        aiSummaryService.toCheckOrUpdateSummary(conversationId, userId);
+                        aiSummaryService.toCheckOrUpdateSummary(conversationId, userId, authorization, modelId);
                     } catch (Exception e) {
                         LogHelper.error("AI 历史摘要生成失败，继续使用现有摘要。conversationId={" + conversationId + "}, error=" + e.getMessage());
                     }
@@ -192,20 +204,7 @@ public class AiChatServiceImpl implements AiChatService {
                     historyMessages = aiMessageMapper.loadCompletedMessagesAfterId(conversationId, summaryUptoMsgId);
                 }
 
-                /** ArrayList<Map<String, String>> messages = new ArrayList<>();
-                 messages.add(systemMessage());
-                 List<AiMessage> history = aiMessageMapper.loadLatestCompletedMessages(conversationId, 20);
-                 if (history != null) {
-                 for (AiMessage message : history) {
-                 messages.add(Map.of("role", message.getRole(), "content", message.getContent()));
-                 }
-                 }
-
-                 messages.add(Map.of("role", "user", "content", request.message()));
-                 saveMessage("user", conversationId, request.message(), AiMessageStatus.COMPLETED); */
-                //List<AiMessage> historyMessages = aiMessageMapper.loadLatestCompletedMessages(conversationId, 20);
-
-                List<ChatModel> messages = aiContextBuilder.build(
+                List<Map<String, Object>> messages = aiContextBuilder.build(
                         SYSTEM_PROMPT,
                         conversation.getSummary(),
                         historyMessages,
@@ -221,55 +220,85 @@ public class AiChatServiceImpl implements AiChatService {
                 LogHelper.info("AI SSE 开始生成，conversationId=" + conversationId);
                 final Long conversationIdFinal = conversationId;
                 emitter.send(SseEmitter.event().name("start").data(new AiStreamEvent("start", "", conversationId, null)));
-                aiModelClient.chatStream(messages, token -> {
-                    if (!context.isGenerating()) return;
-                    // 保存已经生成的内容
-                    //context.append(token);
+                Disposable disposable = llmHttpService.chatStream(messages, null, modelId, authorization).subscribe(
+                        event -> {
+                            if (event == null || !event.isObject()) {
+                                return;
+                            }
 
-                    try {
-                        emitter.send(SseEmitter.event().name("token").data(new AiStreamEvent("token", token, conversationIdFinal, null)));
-                    } catch (IOException e) {
-                        context.cancel();
-                        LogHelper.info("发送 SSE token 失败，客户端可能已断开");
-                    }
-                }, context);
+                            String type = textValue(event, "type");
+                            if (type == null) {
+                                return;
+                            }
 
-                AiMessageStatus finalStatus = context.getStatus();
-                LogHelper.info("AI SSE 生成结束，conversationId=" + conversationId + ", status=" + finalStatus + ", length=" + context.getContent().length());
-                switch (finalStatus) {
-                    case COMPLETED -> {
-                        AiMessage message = aiMessageService.saveMessage(userId, "assistant", conversationId, context.getContent(), AiMessageStatus.COMPLETED);
-                        assistantSaved = true;
-                        emitter.send(SseEmitter.event().name("complete").data(new AiStreamEvent("complete", "", conversationId, message.getId())));
-                        emitter.complete();
-                    }
-                    case CANCELLED -> {
-                        if (!context.getContent().isBlank()) {
-                            aiMessageService.saveMessage(userId, "assistant", conversationId, context.getContent(), finalStatus);
-                            assistantSaved = true;
+                            if ("CONTENT".equals(type)) {
+                                if (!context.isGenerating()) {
+                                    return;
+                                }
+
+                                String token = textValue(event, "content");
+                                if (token == null || token.isEmpty()) {
+                                    return;
+                                }
+
+                                context.append(token);
+
+                                try {
+                                    emitter.send(SseEmitter.event().name("token").data(new AiStreamEvent("token", token, conversationIdFinal, null)));
+                                } catch (IOException e) {
+                                    context.cancel();
+                                    LogHelper.info("发送 SSE token 失败，客户端可能已断开");
+                                }
+                                return;
+                            }
+
+                            if ("COMPLETE".equals(type)) {
+                                if (!context.isGenerating()) {
+                                    return;
+                                }
+
+                                context.complete();
+                                AiMessage message = aiMessageService.saveMessage(userId, "assistant", conversationIdFinal, context.getContent(), AiMessageStatus.COMPLETED);
+                                assistantSaved.set(true);
+
+                                try {
+                                    emitter.send(SseEmitter.event().name("complete").data(new AiStreamEvent("complete", "", conversationIdFinal, message.getId())));
+                                    emitter.complete();
+                                } catch (IOException ignored) {
+                                    // 客户端可能已经断开
+                                }
+                            }
+                        },
+                        error -> {
+                            if (context.isGenerating()) {
+                                context.fail();
+                            }
+
+                            LogHelper.error("AI 流式聊天失败，conversationId={" + conversationIdFinal + "}, error=" + error.getMessage());
+
+                            if (!assistantSaved.get() && conversationIdFinal != null && !context.getContent().isBlank()) {
+                                aiMessageService.saveMessage(userId, "assistant", conversationIdFinal, context.getContent(), context.getStatus());
+                            }
+
+                            try {
+                                String errorMessage = error.getMessage() == null || error.getMessage().isBlank()
+                                        ? "AI 回复生成失败"
+                                        : error.getMessage();
+                                emitter.send(SseEmitter.event().name("error").data(new AiStreamEvent("error", errorMessage, conversationIdFinal, null)));
+                            } catch (IOException ignored) {
+                                // 客户端可能已经断开
+                            }
+                            emitter.completeWithError(error);
                         }
-                        emitter.complete();
-                    }
-                    case TIMEOUT -> {
-                        if (!context.getContent().isBlank()) {
-                            aiMessageService.saveMessage(userId, "assistant", conversationId, context.getContent(), finalStatus);
-                            assistantSaved = true;
-                        }
-                        try {
-                            emitter.send(SseEmitter.event().name("error").data(new AiStreamEvent("error", "AI 回复生成超时", conversationId, null)));
-                        } catch (Exception ignored) {
-                            // 客户端可能已经断开
-                        }
-                        emitter.complete();
-                    }
-                    default -> throw new BusinessException("AI 回复生成失败");
-                }
+                );
+
+                context.setSubscription(disposable);
             } catch (Exception e) {
                 if (context.isGenerating()) context.fail();
                 AiMessageStatus finalStatus = context.getStatus();
 
                 // 失败时保留部分回答；避免已保存成功的回答被重复保存
-                if (!assistantSaved && conversationId != null && !context.getContent().isBlank()) {
+                if (!assistantSaved.get() && conversationId != null && !context.getContent().isBlank()) {
                     aiMessageService.saveMessage(userId, "assistant", conversationId, context.getContent(), finalStatus);
                 }
                 if (finalStatus != AiMessageStatus.CANCELLED) {
@@ -282,4 +311,17 @@ public class AiChatServiceImpl implements AiChatService {
             }
         });
     }
+
+    private String textValue(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        return value == null || value.isNull() ? null : value.asString();
+    }
+
+    private String currentAuthorization() {
+        if (RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attributes) {
+            return attributes.getRequest().getHeader(HttpHeaders.AUTHORIZATION);
+        }
+        return null;
+    }
+
 }

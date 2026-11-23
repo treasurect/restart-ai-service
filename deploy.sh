@@ -9,7 +9,7 @@ set -Eeuo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-ENV_FILE="/Users/treasure/Project/config/restart-server.env"
+ENV_FILE="/Users/treasure/Project/______config/restart-server.env"
 
 SERVER_USER="treasure"
 SERVER_HOST="124.222.46.122"
@@ -192,5 +192,5 @@ ssh "$REMOTE" "
 
     echo '========== 最近启动日志 =========='
 
-    sudo journalctl -u '$SERVICE_NAME' -n 30 --no-pager
+    sudo journalctl -u '$SERVICE_NAME' -n 10 --no-pager
 "

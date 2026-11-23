@@ -1,9 +1,6 @@
 package com.treasure.restart.ai.service;
 
 import com.treasure.common.helper.LogHelper;
-import com.treasure.restart.ai.model.ChatModel;
-import com.treasure.restart.ai.service.llm.AiChatOptions;
-import com.treasure.restart.ai.service.llm.AiModelClient;
 import com.treasure.restart.ai.context.AiTokenCounter;
 import com.treasure.restart.ai.entity.AiConversation;
 import com.treasure.restart.ai.entity.AiMessage;
@@ -13,6 +10,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -23,12 +21,12 @@ public class AiSummaryService {
     private final AiConversationMapper conversationMapper;
     private final AiMessageMapper messageMapper;
     private final AiTokenCounter tokenCounter;
-    private final AiModelClient aiModelClient;
+    private final LlmHttpService llmHttpService;
 
     /**
      * 1.现将用户+助手 计算N轮对话，预留最近2轮消息 再往前 >= 2轮 就形成摘要
      */
-    public void toCheckOrUpdateSummary(Long cid, Long userId) {
+    public void toCheckOrUpdateSummary(Long cid, Long userId, String authorization, String modelId) {
         AiConversation conversation = conversationMapper.getCurrentConversation(cid, userId);
         if (conversation == null) throw new IllegalArgumentException("会话不存在或无权访问");
         Long oldUptoMsgId = conversation.getSummaryUptoMessageId();
@@ -49,7 +47,7 @@ public class AiSummaryService {
         if (newUptoMsgId == null || newUptoMsgId < oldUptoMsgId) return;
 
         String oldSummary = conversation.getSummary();
-        String newSummary = generateSummary(oldSummary, needSaveMessages);
+        String newSummary = generateSummary(oldSummary, needSaveMessages, authorization, modelId);
         if (newSummary == null || newSummary.isBlank()) return;
         int summaryTokens = tokenCounter.count(newSummary);
         int i = conversationMapper.updateSummary(cid, userId, newSummary, newUptoMsgId, summaryTokens, oldUptoMsgId);
@@ -95,7 +93,7 @@ public class AiSummaryService {
         return allTurns;
     }
 
-    private String generateSummary(String oldSummary, ArrayList<AiMessage> needSaveMessages) {
+    private String generateSummary(String oldSummary, ArrayList<AiMessage> needSaveMessages, String authorization, String modelId) {
         StringBuilder builder = new StringBuilder();
         needSaveMessages.forEach(needSaveMessage -> {
             builder.append(needSaveMessage.getRole())
@@ -123,11 +121,18 @@ public class AiSummaryService {
                 [新增的完整对话轮次]:%s。
                 请将这两部分合并为一份最新摘要
                 """.formatted(oldSummary == null || oldSummary.isBlank() ? "无内容" : oldSummary, builder);
-        ArrayList<ChatModel> messages = new ArrayList<>();
-        messages.add(ChatModel.system(systemPrompt));
-        messages.add(ChatModel.user(userPrompt));
-        String summary = aiModelClient.chat(messages, new AiChatOptions(0.1, 1500, false, null)).trim();
-        if (summary.isBlank()) throw new IllegalStateException("DeepSeek 返回空摘要");
+
+        List<Map<String, Object>> messages = new ArrayList<>();
+        messages.add(llmHttpService.textMessage("SYSTEM", systemPrompt));
+        messages.add(llmHttpService.textMessage("USER", userPrompt));
+
+        Map<String, Object> options = new LinkedHashMap<>();
+        options.put("temperature", 0.1);
+        options.put("maxTokens", 1500);
+        options.put("thinkingEnabled", false);
+
+        String summary = llmHttpService.chat(messages, options, modelId, authorization).trim();
+        if (summary.isBlank()) throw new IllegalStateException("LLM 返回空摘要");
         return summary;
     }
 }

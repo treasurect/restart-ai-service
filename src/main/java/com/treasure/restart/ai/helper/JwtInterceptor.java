@@ -23,30 +23,20 @@ public class JwtInterceptor implements HandlerInterceptor {
 
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
-
         if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
             return true;
         }
 
         String authorization = request.getHeader("Authorization");
-
-        if (authorization == null || authorization.isEmpty()) {
-            return unauthorized(response, "未登录");
-        }
-
-        if (!authorization.startsWith("Bearer ")) {
+        if (authorization == null || !authorization.startsWith("Bearer ")) {
             return unauthorized(response, "Token格式错误");
         }
 
         try {
             String token = authorization.substring(7);
-
             Long userId = jwtUtils.getUserId(token);
-
             UserContext.setUserId(userId);
-
             return true;
-
         } catch (JwtException | IllegalArgumentException e) {
             return unauthorized(response, "登录已过期，请重新登录");
         }
@@ -56,17 +46,11 @@ public class JwtInterceptor implements HandlerInterceptor {
         try {
             response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
             response.setContentType("application/json;charset=UTF-8");
-
             BaseResponse<?> result = BaseResponse.error(401, message);
-
-            response.getWriter().write(
-                    objectMapper.writeValueAsString(result)
-            );
-
+            response.getWriter().write(objectMapper.writeValueAsString(result));
         } catch (Exception e) {
             throw new IllegalStateException("响应认证失败信息时发生异常", e);
         }
-
         return false;
     }
 

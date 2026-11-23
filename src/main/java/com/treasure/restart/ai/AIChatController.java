@@ -3,9 +3,11 @@ package com.treasure.restart.ai;
 import com.treasure.common.response.BaseResponse;
 import com.treasure.restart.ai.dto.AiChatRequest;
 import com.treasure.restart.ai.dto.AiChatResponse;
+import com.treasure.restart.ai.dto.AiModelResponse;
 import com.treasure.restart.ai.entity.AiConversation;
 import com.treasure.restart.ai.entity.AiMessage;
 import com.treasure.restart.ai.service.AiChatService;
+import com.treasure.restart.ai.service.LlmHttpService;
 import jakarta.annotation.Resource;
 import jakarta.validation.Valid;
 import org.springframework.http.MediaType;
@@ -19,6 +21,13 @@ import java.util.List;
 public class AIChatController {
     @Resource
     private AiChatService aiChatService;
+    @Resource
+    private LlmHttpService llmHttpService;
+
+    @GetMapping("/models")
+    public BaseResponse<List<AiModelResponse>> loadLlmModels() {
+        return BaseResponse.success("获取成功", llmHttpService.models());
+    }
 
     @PostMapping("/chat/guest")
     public BaseResponse<AiChatResponse> chatAsGuest(@Valid @RequestBody AiChatRequest aiChatRequest) {

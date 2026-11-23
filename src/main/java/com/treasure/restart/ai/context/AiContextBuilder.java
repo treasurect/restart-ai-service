@@ -1,16 +1,15 @@
-
 package com.treasure.restart.ai.context;
 
 import com.treasure.common.helper.LogHelper;
 import com.treasure.common.exception.BusinessException;
 import com.treasure.restart.ai.entity.AiMessage;
-import com.treasure.restart.ai.model.ChatModel;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -25,7 +24,7 @@ public class AiContextBuilder {
         this.objectMapper = objectMapper;
     }
 
-    public List<ChatModel> build(
+    public List<Map<String, Object>> build(
             String systemPrompt,
             List<AiMessage> history,
             String currentMessage,
@@ -34,7 +33,7 @@ public class AiContextBuilder {
         return build(systemPrompt, null, history, currentMessage, null, maxInputTokens);
     }
 
-    public List<ChatModel> build(
+    public List<Map<String, Object>> build(
             String systemPrompt,
             String summary,
             List<AiMessage> history,
@@ -50,7 +49,7 @@ public class AiContextBuilder {
      * maxInputTokens 包含 system、摘要、历史消息、
      * 当前用户消息的文本 Token。
      */
-    public List<ChatModel> build(
+    public List<Map<String, Object>> build(
             String systemPrompt,
             String summary,
             List<AiMessage> history,
@@ -107,31 +106,40 @@ public class AiContextBuilder {
 
         Collections.reverse(selectedTurns);
         //===================================================================================
-        //组合deepseek 的消息 前序+概要+历史+当前
-        List<ChatModel> messages = new ArrayList<>();
-        messages.add(ChatModel.system(safeSystemPrompt));
-        if (safeSummary != null) messages.add(ChatModel.system("""
-                        以下是此前对话的历史摘要，仅用于理解背景。
-                        如果摘要与当前用户明确提供的新信息冲突，
-                        应优先采用当前用户提供的信息。
-                        
-                        历史摘要：
-                        """ + safeSummary));
+        //组合发送给 LLM 的消息：前序 + 概要 + 历史 + 当前
+        List<Map<String, Object>> messages = new ArrayList<>();
+        messages.add(systemMessage(safeSystemPrompt));
+        if (safeSummary != null) {
+            messages.add(systemMessage("""
+                    以下是此前对话的历史摘要，仅用于理解背景。
+                    如果摘要与当前用户明确提供的新信息冲突，
+                    应优先采用当前用户提供的信息。
+                    
+                    历史摘要：
+                    """ + safeSummary));
+        }
         // 历史消息
         for (List<AiMessage> turn : selectedTurns) {
             for (AiMessage message : turn) {
                 String role = message.getRole().toLowerCase();
                 if ("user".equals(role)) {
                     List<String> imageUrls = getImageUrls(message.getExtra());
-                    //content = buildImageContent(message.getContent(), imageUrls);
-                    messages.add(ChatModel.user(message.getContent(), imageUrls));
+                    String content = message.getContent();
+                    if ((content == null || content.isBlank()) && imageUrls.isEmpty()) {
+                        continue;
+                    }
+                    messages.add(userMessage(content, imageUrls));
                 } else {
                     // assistant 消息：始终使用普通文本
-                    messages.add(ChatModel.assistant(message.getContent()));
+                    String content = message.getContent();
+                    if (content == null || content.isBlank()) {
+                        continue;
+                    }
+                    messages.add(assistantMessage(content));
                 }
             }
         }
-        messages.add(ChatModel.user(safeCurrentMessage, currentImageUrls));
+        messages.add(userMessage(safeCurrentMessage, currentImageUrls));
         LogHelper.info(
                 "AiContextBuilder -> systemTokens={" + systemTokens
                         + "}, summaryTokens={" + summaryTokens
@@ -190,38 +198,6 @@ public class AiContextBuilder {
         return turns;
     }
 
-    public Object buildImageContent(String text, List<String> imageUrls) {
-        String safeText = text == null ? "" : text;
-        List<String> safeImageUrls = imageUrls == null
-                ? List.of() : imageUrls.stream().filter(url -> url != null && !url.isBlank()).toList();
-
-        if (safeImageUrls.isEmpty()) {
-            if (safeText.isBlank()) {
-                throw new BusinessException(400, "消息内容不能为空");
-            }
-            // 纯文本仍然传 String
-            return safeText;
-        }
-
-        List<Map<String, Object>> content = new ArrayList<>();
-
-        if (!safeText.isBlank()) {
-            content.add(Map.of("type", "text", "text", safeText));
-        }
-
-        for (String imageUrl : safeImageUrls) {
-            content.add(Map.of(
-                    "type", "image_url",
-                    "image_url", Map.of(
-                            "url", imageUrl,
-                            "detail", "auto"
-                    )
-            ));
-        }
-
-        return content;
-    }
-
     private List<String> getImageUrls(String extra) {
         if (extra == null || extra.isBlank()) {
             return List.of();
@@ -243,5 +219,52 @@ public class AiContextBuilder {
         } catch (Exception e) {
             throw new BusinessException(500, "历史图片信息解析失败");
         }
+    }
+
+    private Map<String, Object> systemMessage(String text) {
+        return message("SYSTEM", List.of(textContent(text)));
+    }
+
+    private Map<String, Object> assistantMessage(String text) {
+        return message("ASSISTANT", List.of(textContent(text)));
+    }
+
+    private Map<String, Object> userMessage(String text) {
+        return userMessage(text, null);
+    }
+
+    private Map<String, Object> userMessage(String text, List<String> imageUrls) {
+        List<Map<String, Object>> contents = new ArrayList<>();
+        if (text != null && !text.isBlank()) {
+            contents.add(textContent(text));
+        }
+        if (imageUrls != null) {
+            imageUrls.stream()
+                    .filter(url -> url != null && !url.isBlank())
+                    .forEach(url -> contents.add(imageContent(url)));
+        }
+        return message("USER", contents);
+    }
+
+    private Map<String, Object> message(String role, List<Map<String, Object>> contents) {
+        Map<String, Object> message = new LinkedHashMap<>();
+        message.put("role", role);
+        message.put("contents", contents);
+        return message;
+    }
+
+    private Map<String, Object> textContent(String text) {
+        Map<String, Object> content = new LinkedHashMap<>();
+        content.put("type", "TEXT");
+        content.put("text", text);
+        return content;
+    }
+
+    private Map<String, Object> imageContent(String imageUrl) {
+        Map<String, Object> content = new LinkedHashMap<>();
+        content.put("type", "IMAGE_URL");
+        content.put("imageUrl", imageUrl);
+        content.put("detail", "auto");
+        return content;
     }
 }
